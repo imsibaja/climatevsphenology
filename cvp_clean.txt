@@ -1,0 +1,102 @@
+# Import required libraries
+import os
+import pandas as pd
+import numpy as np
+import geopandas as gpd
+from sklearn.linear_model import LinearRegression
+import statsmodels.formula.api as smf
+import matplotlib.pyplot as plt
+import seaborn as sns
+from plotly.subplots import make_subplots
+import plotly.graph_objects as go
+import plotly.express as px
+
+# Constants
+CLIMATE_DATA_DIR = './data/climate/'
+COOP_NAMES_FILE = './data/Coopnames.csv'
+FLOWERS_FILE = './data/flowersCA.csv'
+CLIMATE_DIVS_SHAPEFILE = './data/climateDiv/GIS.OFFICIAL_CLIM_DIVISIONS.shp'
+
+# Helper functions
+def load_climate_data(directory):
+    """Load and process climate data files."""
+    climate_data = {}
+    for filename in os.listdir(directory):
+        if filename.endswith('.csv'):
+            df = pd.read_csv(os.path.join(directory, filename), encoding='unicode_escape')
+            df['COOP_ID'] = filename[1:6]
+            df['type'] = filename[7:8]
+            df = df.loc[:, ~df.columns.str.contains('^Unnamed')]
+            climate_data[filename] = df
+    return climate_data
+
+def process_coop_data(climate_data, coop_names_file):
+    """Merge and clean climate data with cooperative station names."""
+    coop_names = pd.read_csv(coop_names_file).drop([0, 1, 2]).reset_index(drop=True)
+    coop_names = coop_names[['COOP_ID', 'COOP_NAME', 'DIV', 'LATITUDE', 'LONGITUDE']]
+    coop_names['COOP_ID'] = coop_names['COOP_ID'].astype(int)
+
+    coop = pd.concat(climate_data.values(), ignore_index=True)
+    coop = coop[(coop['YEAR(S)'] >= 1966) & (coop['YEAR(S)'] <= 2016)]
+    coop = coop.replace(['-----'], np.nan).reset_index(drop=True)
+    coop = coop.loc[:, ~coop.columns.str.contains('^Unnamed')]
+    coop = coop.merge(coop_names, on='COOP_ID', how='left')
+    return coop
+
+def create_flower_dataframe(species, is_native):
+    """Create and process flower observation data for a given species."""
+    file_path = f"./data/{species}/occurrence.txt"
+    df = pd.read_csv(file_path, sep='\t', low_memory=False)
+    df = df[['scientificName', 'decimalLongitude', 'decimalLatitude', 'day', 'month', 'year', 'countryCode', 'stateProvince']]
+    df['native'] = is_native
+    df = df[(df['countryCode'] == "US") & (df['stateProvince'].isin(["California", "Ca"]))]
+    df = df[(df['decimalLongitude'] > -125) & (df['decimalLongitude'] < -113)]
+    df = df.dropna().reset_index(drop=True)
+    df['DOY'] = pd.to_datetime(df[['year', 'month', 'day']]).dt.dayofyear
+    df = df.rename(columns={'decimalLongitude': 'longitude', 'decimalLatitude': 'latitude'})
+    df['longitude'] = df['longitude'].round(3)
+    df['latitude'] = df['latitude'].round(3)
+    return df
+
+def process_climate_divisions(shape_file):
+    """Load and process climate division shapefiles."""
+    climate_divs = gpd.read_file(shape_file)
+    climate_divs = climate_divs[climate_divs["ST_ABBRV"] == 'CA'][["CD_NEW", 'geometry']]
+    climate_divs = climate_divs.set_crs("EPSG:4326")
+    return climate_divs
+
+# Main execution
+if __name__ == "__main__":
+    # Load and process climate data
+    climate_data = load_climate_data(CLIMATE_DATA_DIR)
+    coop_data = process_coop_data(climate_data, COOP_NAMES_FILE)
+
+    # Process flower data
+    native_species = ['Lasthenia californica', 'Plantago erecta Morris', 'Clarkia purpurea',
+                      'Clarkia bottae', 'Chaenactis glabriuscula', 'Amsinckia menziesii']
+    non_native_species = ['Medicago polymorpha', 'Centaurea solstitialis', 'Brassica tournefortii Gouan']
+
+    flowers = pd.concat(
+        [create_flower_dataframe(species, 'yes') for species in native_species] +
+        [create_flower_dataframe(species, 'no') for species in non_native_species]
+    )
+
+    # Convert flower data to GeoDataFrame
+    flowers = gpd.GeoDataFrame(flowers, geometry=gpd.points_from_xy(flowers.longitude, flowers.latitude))
+    flowers = flowers.set_crs("EPSG:4326")
+
+    # Process climate divisions and join with flower data
+    climate_divs = process_climate_divisions(CLIMATE_DIVS_SHAPEFILE)
+    flowers = gpd.sjoin(flowers, climate_divs, how='inner', predicate='within')
+    flowers = flowers.rename(columns={'CD_NEW': 'ClimateDivision'}).reset_index(drop=True)
+
+    # Save processed data
+    flowers.to_csv(FLOWERS_FILE, index=False)
+
+    # Example visualization
+    plt.figure(figsize=(10, 8))
+    sns.regplot(data=flowers, x='longitude', y='latitude', fit_reg=False, scatter_kws={'alpha': 0.5})
+    plt.title('Flower Observations in California')
+    plt.xlabel('Longitude')
+    plt.ylabel('Latitude')
+    plt.show()
